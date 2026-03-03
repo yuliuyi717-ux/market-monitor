@@ -11,10 +11,19 @@ import websockets
 
 
 class DataPipeline:
-    def __init__(self, config: dict[str, Any], incremental_store: str | None = None, request_timeout: float = 5.0):
+    def __init__(
+        self,
+        config: dict[str, Any],
+        incremental_store: str | None = None,
+        request_timeout: float = 5.0,
+        max_retries: int = 2,
+        retry_backoff: float = 0.2,
+    ):
         self.config = config
         self.incremental_store = Path(incremental_store) if incremental_store else None
         self.request_timeout = request_timeout
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
 
     def _load_incremental_state(self) -> dict[str, str]:
         if not self.incremental_store or not self.incremental_store.exists():
@@ -38,12 +47,14 @@ class DataPipeline:
         records_by_source: dict[str, list[dict[str, Any]]] = {}
         records: list[dict[str, Any]] = []
         errors = 0
+        error_details: list[dict[str, str]] = []
 
         for source, result in zip(sources, results):
             source_name = source["name"]
             if isinstance(result, Exception):
                 errors += 1
                 records_by_source[source_name] = []
+                error_details.append({"source": source_name, "error": str(result)})
                 continue
             normalized = [self._normalize_record(source_name, item, source.get("mapping"), source.get("unit")) for item in result]
             records_by_source[source_name] = normalized
@@ -59,6 +70,7 @@ class DataPipeline:
                 "records": len(filtered_records),
                 "sources": len(sources),
                 "errors": errors,
+                "error_details": error_details,
                 "source_breakdown": {name: len(items) for name, items in records_by_source.items()},
             },
         }
@@ -122,12 +134,27 @@ class DataPipeline:
             return await self._fetch_websocket(source)
         raise ValueError(f"unsupported source type: {source_type}")
 
+    def _source_timeout(self, source: dict[str, Any]) -> float:
+        return float(source.get("timeout", self.request_timeout))
+
     async def _fetch_rest(self, source: dict[str, Any]) -> list[dict[str, Any]]:
-        timeout = aiohttp.ClientTimeout(total=self.request_timeout)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(source["url"]) as response:
-                response.raise_for_status()
-                payload = await response.json()
+        payload = None
+        last_error: Exception | None = None
+        timeout = aiohttp.ClientTimeout(total=self._source_timeout(source))
+        for attempt in range(self.max_retries + 1):
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(source["url"]) as response:
+                        response.raise_for_status()
+                        payload = await response.json()
+                        break
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                last_error = exc
+                if attempt == self.max_retries:
+                    raise
+                await asyncio.sleep(self.retry_backoff * (attempt + 1))
+        if payload is None and last_error is not None:
+            raise last_error
         if isinstance(payload, list):
             return payload
         if isinstance(payload, dict):
@@ -138,23 +165,39 @@ class DataPipeline:
 
     async def _fetch_csv(self, source: dict[str, Any]) -> list[dict[str, Any]]:
         if source.get("url"):
-            timeout = aiohttp.ClientTimeout(total=self.request_timeout)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(source["url"]) as response:
-                    response.raise_for_status()
-                    content = await response.text()
+            content = ""
+            timeout = aiohttp.ClientTimeout(total=self._source_timeout(source))
+            for attempt in range(self.max_retries + 1):
+                try:
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.get(source["url"]) as response:
+                            response.raise_for_status()
+                            content = await response.text()
+                            break
+                except (aiohttp.ClientError, asyncio.TimeoutError):
+                    if attempt == self.max_retries:
+                        raise
+                    await asyncio.sleep(self.retry_backoff * (attempt + 1))
         else:
             content = Path(source["path"]).read_text(encoding="utf-8")
         reader = csv.DictReader(StringIO(content))
         return [dict(row) for row in reader]
 
     async def _fetch_graphql(self, source: dict[str, Any]) -> list[dict[str, Any]]:
-        timeout = aiohttp.ClientTimeout(total=self.request_timeout)
+        timeout = aiohttp.ClientTimeout(total=self._source_timeout(source))
         payload = {"query": source.get("query"), "variables": source.get("variables", {})}
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(source["url"], json=payload) as response:
-                response.raise_for_status()
-                body = await response.json()
+        body = {}
+        for attempt in range(self.max_retries + 1):
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(source["url"], json=payload) as response:
+                        response.raise_for_status()
+                        body = await response.json()
+                        break
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                if attempt == self.max_retries:
+                    raise
+                await asyncio.sleep(self.retry_backoff * (attempt + 1))
         data = body.get("data", {})
         return self._extract_path(data, source.get("data_path", ""))
 
@@ -169,17 +212,24 @@ class DataPipeline:
         return content
 
     async def _fetch_websocket(self, source: dict[str, Any]) -> list[dict[str, Any]]:
-        messages = []
+        messages: list[dict[str, Any]] = []
         max_messages = int(source.get("max_messages", 10))
-        timeout = float(source.get("timeout", self.request_timeout))
+        timeout = self._source_timeout(source)
 
-        async with websockets.connect(source["url"], open_timeout=timeout) as websocket:
-            for _ in range(max_messages):
-                try:
-                    raw = await asyncio.wait_for(websocket.recv(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    break
-                messages.append(json.loads(raw))
+        for attempt in range(self.max_retries + 1):
+            try:
+                async with websockets.connect(source["url"], open_timeout=timeout) as websocket:
+                    for _ in range(max_messages):
+                        try:
+                            raw = await asyncio.wait_for(websocket.recv(), timeout=timeout)
+                        except asyncio.TimeoutError:
+                            break
+                        messages.append(json.loads(raw))
+                break
+            except (websockets.WebSocketException, OSError, asyncio.TimeoutError):
+                if attempt == self.max_retries:
+                    raise
+                await asyncio.sleep(self.retry_backoff * (attempt + 1))
         return messages
 
     def _extract_path(self, payload: dict[str, Any], path: str) -> list[dict[str, Any]]:

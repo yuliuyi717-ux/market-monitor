@@ -19,6 +19,8 @@ class _MockHandler(BaseHTTPRequestHandler):
     rest_payload = []
     csv_payload = []
     graphql_payload = []
+    rest_failures_before_success = 0
+    rest_calls = 0
 
     def _write_json(self, payload):
         body = json.dumps(payload).encode("utf-8")
@@ -30,6 +32,11 @@ class _MockHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         if self.path == "/rest":
+            self.__class__.rest_calls += 1
+            if self.__class__.rest_calls <= self.__class__.rest_failures_before_success:
+                self.send_response(500)
+                self.end_headers()
+                return
             self._write_json(self.rest_payload)
             return
         if self.path == "/csv":
@@ -62,6 +69,8 @@ def run_http_server(rest_payload, csv_payload, graphql_payload):
     _MockHandler.rest_payload = rest_payload
     _MockHandler.csv_payload = csv_payload
     _MockHandler.graphql_payload = graphql_payload
+    _MockHandler.rest_failures_before_success = 0
+    _MockHandler.rest_calls = 0
     server = ThreadingHTTPServer(("127.0.0.1", 0), _MockHandler)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -87,6 +96,24 @@ async def _run_ws_server(messages, stop_event, port_holder):
 
 
 class DataPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pipeline_retries_transient_rest_failure(self):
+        rest_rows = [{"timestamp": "2026-01-01T10:00:00Z", "value": 42, "unit": "usd"}]
+        with run_http_server(rest_rows, [], []) as http_port:
+            _MockHandler.rest_failures_before_success = 1
+            config = {
+                "sources": [
+                    {
+                        "name": "rest",
+                        "type": "rest",
+                        "url": f"http://127.0.0.1:{http_port}/rest",
+                    }
+                ]
+            }
+            result = await DataPipeline(config).run()
+
+        self.assertEqual(0, result["stats"]["errors"])
+        self.assertEqual(1, len(result["records"]))
+
     async def test_pipeline_fetches_and_normalizes_all_source_types(self):
         rest_rows = [{"timestamp": "2026-01-01T10:00:00Z", "value": 10, "unit": "usd"}]
         csv_rows = [{"timestamp": "2026-01-01T10:01:00Z", "value": 11, "unit": "usd"}]
